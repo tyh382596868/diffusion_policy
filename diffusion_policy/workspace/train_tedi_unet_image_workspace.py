@@ -20,7 +20,7 @@ import tqdm
 import numpy as np
 import shutil
 from diffusion_policy.workspace.base_workspace import BaseWorkspace
-from diffusion_policy.policy.diffusion_unet_image_policy import DiffusionUnetImagePolicy
+from diffusion_policy.policy.tedi_unet_image_policy import TEDIUnetImagePolicy
 from diffusion_policy.dataset.base_dataset import BaseImageDataset
 from diffusion_policy.env_runner.base_image_runner import BaseImageRunner
 from diffusion_policy.common.checkpoint_util import TopKCheckpointManager
@@ -31,7 +31,7 @@ from diffusion_policy.model.common.lr_scheduler import get_scheduler
 
 OmegaConf.register_new_resolver("eval", eval, replace=True)
 
-class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
+class TrainTEDIUnetImageWorkspace(BaseWorkspace):
     include_keys = ['global_step', 'epoch']
 
     def __init__(self, cfg: OmegaConf, output_dir=None):
@@ -44,11 +44,13 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
         random.seed(seed)
 
         # configure model
-        self.model: DiffusionUnetImagePolicy = hydra.utils.instantiate(cfg.policy)
+        self.model: TEDIUnetImagePolicy = hydra.utils.instantiate(cfg.policy)
 
-        self.ema_model: DiffusionUnetImagePolicy = None
+        self.ema_model: TEDIUnetImagePolicy = None
         if cfg.training.use_ema:
             self.ema_model = copy.deepcopy(self.model)
+        else:
+            raise ValueError("Must use EMA model")
 
         # configure training state
         self.optimizer = hydra.utils.instantiate(
@@ -216,6 +218,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
 
                 # run rollout
                 if (self.epoch % cfg.training.rollout_every) == 0:
+                    policy.reset_buffer()
                     runner_log = env_runner.run(policy)
                     # log all
                     step_log.update(runner_log)
@@ -245,9 +248,18 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
                         batch = dict_apply(train_sampling_batch, lambda x: x.to(device, non_blocking=True))
                         obs_dict = batch['obs']
                         gt_action = batch['action']
-                        
+
+                        policy.reset_buffer()
                         result = policy.predict_action(obs_dict)
-                        pred_action = result['action_pred']
+                        # In contrast to Diffusion Policy, we only score the predicted
+                        # action chunk; the later buffer steps are still noisy.
+                        pred_action = result['action']
+
+                        # Cut GT to be (B, Ta, Da)
+                        start = cfg.n_obs_steps - 1
+                        end = start + cfg.n_action_steps
+                        gt_action = gt_action[:,start:end]
+
                         mse = torch.nn.functional.mse_loss(pred_action, gt_action)
                         step_log['train_action_mse_error'] = mse.item()
                         del batch
@@ -293,7 +305,7 @@ class TrainDiffusionUnetImageWorkspace(BaseWorkspace):
     config_path=str(pathlib.Path(__file__).parent.parent.joinpath("config")), 
     config_name=pathlib.Path(__file__).stem)
 def main(cfg):
-    workspace = TrainDiffusionUnetImageWorkspace(cfg)
+    workspace = TrainTEDIUnetImageWorkspace(cfg)
     workspace.run()
 
 if __name__ == "__main__":
